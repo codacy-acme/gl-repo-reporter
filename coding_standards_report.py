@@ -4,7 +4,8 @@ import os
 import requests
 import argparse
 import csv
-from typing import List, Dict, Any, Optional
+import time
+from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 from datetime import datetime
 
@@ -25,51 +26,76 @@ class CodacyAPI:
             "Accept": "application/json"
         }
 
+    def _make_request(self, url: str, params: Dict = None, max_retries: int = 3) -> Dict:
+        """Make an API request with retry logic and rate limit handling"""
+        retries = 0
+        while retries < max_retries:
+            try:
+                response = requests.get(url, headers=self.headers, params=params)
+                
+                if response.status_code == 429:  # Rate limited
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    print(f"\nRate limited. Waiting {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    retries += 1
+                    continue
+                
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                retries += 1
+                if retries == max_retries:
+                    raise Exception(f"API request failed after {max_retries} retries: {str(e)}")
+                print(f"\nRequest failed, retrying ({retries}/{max_retries}): {str(e)}")
+                time.sleep(2 ** retries)  # Exponential backoff
+        
+        raise Exception("Maximum retries exceeded")
+
     def get_coding_standards(self) -> List[Dict[str, Any]]:
         """Fetch all coding standards for the organization"""
         url = f"{self.base_url}/organizations/{self.provider}/{self.organization}/coding-standards"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        standards = response.json()["data"]
-        return [s for s in standards if not s.get("isDraft", False)]
+        standards = self._make_request(url)["data"]
+        return [s for s in standards if not s.get("isDraft", False)]  # Always exclude drafts
 
     def get_repositories_for_standard(self, standard_id: str) -> List[Dict[str, Any]]:
         """Get repositories attached to a specific coding standard"""
         url = f"{self.base_url}/organizations/{self.provider}/{self.organization}/coding-standards/{standard_id}/repositories"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()["data"]
+        return self._make_request(url)["data"]
 
-    def get_repository_issues(self, repository: str) -> Dict[str, int]:
-        """Get issues for a specific repository"""
-        issues_count = {"Critical": 0, "Medium": 0, "Minor": 0}
-        cursor = None
-        
-        while True:
-            url = f"{self.base_url}/analysis/organizations/{self.provider}/{self.organization}/repositories/{repository}/issues"
-            params = {"limit": 100}
-            if cursor:
-                params["cursor"] = cursor
+    def get_repository_analysis(self, repository: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Get repository analysis information"""
+        try:
+            url = f"{self.base_url}/analysis/organizations/{self.provider}/{self.organization}/repositories/{repository}"
+            response = self._make_request(url)
+            data = response.get("data", {})
             
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            data = response.json()
+            # Calculate coverage percentage
+            coverage_data = data.get("coverage", {})
+            total_files = coverage_data.get("numberTotalFiles", 0)
+            uncovered_files = coverage_data.get("filesUncovered", 0)
+            low_coverage_files = coverage_data.get("filesWithLowCoverage", 0)
+            coverage_percentage = 0 if total_files == 0 else ((total_files - uncovered_files - low_coverage_files) / total_files) * 100
             
-            for issue in data.get("data", []):
-                severity = issue.get("patternInfo", {}).get("severityLevel")
-                if severity == "Error":
-                    issues_count["Critical"] += 1
-                elif severity == "Warning":
-                    issues_count["Medium"] += 1
-                elif severity == "Info":
-                    issues_count["Minor"] += 1
+            # Extract metrics from the response
+            metrics = {
+                "grade": f"{data.get('gradeLetter', 'N/A')} ({data.get('grade', 0)}%)",
+                "issues": {
+                    "Critical": 0,  # These are not broken down by severity in the response
+                    "Medium": 0,
+                    "Minor": 0,
+                    "Total": data.get("issuesCount", 0)
+                },
+                "coverage": round(coverage_percentage, 2),
+                "complexity": data.get("complexFilesCount", 0),
+                "duplication": data.get("duplicationPercentage", 0),
+                "loc": data.get("loc", 0)
+            }
             
-            pagination = data.get("pagination", {})
-            cursor = pagination.get("cursor")
-            if not cursor:
-                break
-        
-        return issues_count
+            return metrics, None
+        except Exception as e:
+            if "404" in str(e):
+                return {}, "Repository not analyzed"
+            return {}, str(e)
 
 def generate_report(api: CodacyAPI) -> None:
     """Generate a report of coding standards and their associated repositories and issues"""
@@ -85,32 +111,69 @@ def generate_report(api: CodacyAPI) -> None:
     
     with open(report_file, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["Coding Standard", "Repository", "Critical Issues", "Medium Issues", "Minor Issues", "Total Issues"])
+        writer.writerow([
+            "Coding Standard",
+            "Is Default",
+            "Enabled Tools",
+            "Enabled Patterns",
+            "Repository",
+            "Grade",
+            "Total Issues",
+            "Lines of Code",
+            "Coverage %",
+            "Complex Files",
+            "Duplication %",
+            "Error"
+        ])
         
         for standard in tqdm(standards, desc="Processing coding standards"):
             print(f"\nAnalyzing coding standard: {standard['name']}")
             repositories = api.get_repositories_for_standard(standard['id'])
             
             if not repositories:
-                writer.writerow([standard['name'], "No repositories", 0, 0, 0, 0])
+                writer.writerow([
+                    standard['name'],
+                    standard.get('isDefault', False),
+                    standard.get('meta', {}).get('enabledToolsCount', 0),
+                    standard.get('meta', {}).get('enabledPatternsCount', 0),
+                    "No repositories",
+                    "N/A", 0, 0, 0, 0, 0,
+                    ""
+                ])
                 continue
             
             for repo in tqdm(repositories, desc="Processing repositories", leave=False):
-                try:
-                    issues = api.get_repository_issues(repo['name'])
-                    total_issues = sum(issues.values())
+                repo_name = repo.get("name", "")
+                if not repo_name:
+                    continue
                     
+                metrics, error = api.get_repository_analysis(repo_name)
+                
+                if error:
                     writer.writerow([
                         standard['name'],
-                        repo['name'],
-                        issues['Critical'],
-                        issues['Medium'],
-                        issues['Minor'],
-                        total_issues
+                        standard.get('isDefault', False),
+                        standard.get('meta', {}).get('enabledToolsCount', 0),
+                        standard.get('meta', {}).get('enabledPatternsCount', 0),
+                        repo_name,
+                        "N/A", "Error", "Error", "Error", "Error", "Error",
+                        error
                     ])
-                except Exception as e:
-                    print(f"Error processing repository {repo['name']}: {str(e)}")
-                    writer.writerow([standard['name'], repo['name'], "Error", "Error", "Error", "Error"])
+                else:
+                    writer.writerow([
+                        standard['name'],
+                        standard.get('isDefault', False),
+                        standard.get('meta', {}).get('enabledToolsCount', 0),
+                        standard.get('meta', {}).get('enabledPatternsCount', 0),
+                        repo_name,
+                        metrics.get("grade", "N/A"),
+                        metrics.get("issues", {}).get("Total", 0),
+                        metrics.get("loc", 0),
+                        metrics.get("coverage", 0),
+                        metrics.get("complexity", 0),
+                        metrics.get("duplication", 0),
+                        ""
+                    ])
     
     print(f"\nReport generated: {report_file}")
 
